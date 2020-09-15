@@ -341,7 +341,7 @@ def create_cf(session, name, key_type="varchar", speculative_retry=None, read_re
         logger.warn('AlreadyExists executing create cf query \'%s\'' % query)
     session.cluster.control_connection.wait_for_schema_agreement(wait_time=120)
     #Going to ignore OperationTimedOut from create CF, so need to validate it was indeed created
-    session.execute('SELECT * FROM %s LIMIT 1' % name);
+    session.execute('SELECT * FROM %s LIMIT 1' % name)
 
 
 def create_cf_simple(session, name, query):
