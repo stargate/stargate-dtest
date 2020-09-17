@@ -232,7 +232,7 @@ class DTestSetup(object):
         return session
 
     def patient_cql_connection(self, node, keyspace=None,
-                               user=None, password=None, timeout=60, compression=True,
+                               user=None, password=None, timeout=120, compression=True,
                                protocol_version=None, port=None, ssl_opts=None, **kwargs):
         """
         Returns a connection after it stops throwing NoHostAvailables due to not being ready.
