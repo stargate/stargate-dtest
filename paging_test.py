@@ -3015,7 +3015,7 @@ class TestPagingDatasetChanges(BasePagingTester, PageAssertionMixin):
         cluster = self.cluster
         cluster.populate(3).start()
         node1, node2, node3 = cluster.nodelist()
-        session = self.cql_connection(node1)
+        session = self.patient_cql_connection(node1)
         create_ks(session, 'test_paging_size', 1)
         session.execute("CREATE TABLE paging_test ( id uuid, mytext text, PRIMARY KEY (id, mytext) )")
 
