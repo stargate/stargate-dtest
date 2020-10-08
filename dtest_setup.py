@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 def retry_till_success(fun, *args, **kwargs):
     timeout = kwargs.pop('timeout', 60)
+    sleep = kwargs.pop('sleep', 0.25)
     bypassed_exception = kwargs.pop('bypassed_exception', Exception)
 
     deadline = time.time() + timeout
@@ -42,7 +43,7 @@ def retry_till_success(fun, *args, **kwargs):
                 raise
             else:
                 # brief pause before next attempt
-                time.sleep(0.25)
+                time.sleep(sleep)
 
 
 class DTestSetup(object):
