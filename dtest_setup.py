@@ -205,7 +205,8 @@ class DTestSetup(object):
                 port = get_port_from_node(node)
 
         if protocol_version is None:
-            protocol_version = get_eager_protocol_version(node.cluster.version())
+            protocol_version = get_eager_protocol_version(node.cluster.version(),
+                                                          use_stargate=self.dtest_config.use_stargate)
 
         if user is not None:
             auth_provider = get_auth_provider(user=user, password=password)
@@ -341,7 +342,7 @@ class DTestSetup(object):
             logger.debug(stderr)
 
     def supports_v5_protocol(self, cluster_version):
-        return cluster_version >= LooseVersion('4.0')
+        return cluster_version >= LooseVersion('4.0') and not self.dtest_config.use_stargate
 
     def cleanup_last_test_dir(self):
         if os.path.exists(self.last_test_dir):
