@@ -238,6 +238,7 @@ class TestCQL(CQLTester):
         session.execute("DROP TYPE address_t")
         assert 'address_t' not in ks_meta.user_types
 
+    @pytest.mark.requires_sg_auth
     def test_user(self):
         """
         Smoke test for basic USER queries:

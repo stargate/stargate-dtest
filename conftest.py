@@ -548,7 +548,7 @@ def dtest_config(request):
 
 
 @pytest.fixture(scope='function', autouse=True)
-def reset_stargate(dtest_config):
+def reset_stargate(request, dtest_config):
     """
     If enabled, stargate must be started before first test and restarted between tests. Restart clears its cached schema & peer info.
     """
@@ -558,10 +558,15 @@ def reset_stargate(dtest_config):
 
         # Start stargate, binding to a unique IP, connecting to backend ccm cluster at 127.0.0.1
         global _starctl_proc
-        _starctl_proc = subprocess.Popen(
-            [dtest_config.stargate_cmd, '--cluster-name', fixture_dtest_cluster_name(), '--cluster-seed', '127.0.0.1',
-             '--listen', dtest_config.stargate_ip, '--cql-port', str(dtest_config.stargate_port),
-             '--cluster-version', cassandra_major_version, '--simple-snitch',])
+        args = [dtest_config.stargate_cmd, '--cluster-name', fixture_dtest_cluster_name(), '--cluster-seed', '127.0.0.1',
+               '--listen', dtest_config.stargate_ip, '--cql-port', str(dtest_config.stargate_port),
+               '--cluster-version', cassandra_major_version, '--simple-snitch', ]
+
+        enable_auth = request.node.get_marker('requires_sg_auth')
+        if enable_auth:
+            args.append('--enable-auth')
+
+        _starctl_proc = subprocess.Popen(args)
 
         if _starctl_proc.returncode:
             raise Exception('c2ctl background process failed to start correctly')

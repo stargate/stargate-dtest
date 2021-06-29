@@ -25,6 +25,7 @@ from cassandra.concurrent import execute_concurrent_with_args
 from cassandra.query import BatchStatement, BatchType
 from ccmlib import common
 
+import conftest
 from .cqlsh_tools import monkeypatch_driver, unmonkeypatch_driver
 from dtest import Tester, create_ks, create_cf
 from dtest_setup import retry_till_success
@@ -750,6 +751,7 @@ VALUES (4, blobAsInt(0x), '', blobAsBigint(0x), 0x, blobAsBoolean(0x), blobAsDec
     # If enabled, log all stdout/stderr of cqlsh commands
     cqlsh_debug_enabled = False
 
+    @pytest.mark.requires_sg_auth
     def test_list_queries(self):
         config = {'authenticator': 'org.apache.cassandra.auth.PasswordAuthenticator',
                   'authorizer': 'org.apache.cassandra.auth.CassandraAuthorizer',
@@ -2508,6 +2510,7 @@ class TestCqlLogin(Tester, CqlshMixin):
 
         assert [message in x for x in input.split("\n") if x] == [True]
 
+    @pytest.mark.requires_sg_auth
     def test_login_keeps_keyspace(self):
         create_ks(self.session, 'ks1', 1)
         create_cf(self.session, 'ks1table')
@@ -2524,6 +2527,7 @@ class TestCqlLogin(Tester, CqlshMixin):
         assert [x for x in cqlsh_stdout.split() if x], ['ks1table' == 'ks1table']
         assert cqlsh_stderr == ''
 
+    @pytest.mark.requires_sg_auth
     def test_login_rejects_bad_pass(self):
         create_ks(self.session, 'ks1', 1)
         create_cf(self.session, 'ks1table')
@@ -2537,6 +2541,7 @@ class TestCqlLogin(Tester, CqlshMixin):
 
         self.assert_login_not_allowed('user1', cqlsh_stderr)
 
+    @pytest.mark.requires_sg_auth
     def test_login_authenticates_correct_user(self):
         create_ks(self.session, 'ks1', 1)
         create_cf(self.session, 'ks1table')
@@ -2568,6 +2573,7 @@ class TestCqlLogin(Tester, CqlshMixin):
                       "cqlsh stderr output: {}".format(expected_error,
                                                        '\n'.join(err_lines)))
 
+    @pytest.mark.requires_sg_auth
     def test_login_allows_bad_pass_and_continued_use(self):
         create_ks(self.session, 'ks1', 1)
         create_cf(self.session, 'ks1table')
@@ -2584,6 +2590,7 @@ class TestCqlLogin(Tester, CqlshMixin):
         self.assert_login_not_allowed('user1', cqlsh_stderr)
 
     @since('2.2')
+    @pytest.mark.requires_sg_auth
     def test_list_roles_after_login(self):
         """
         @jira_ticket CASSANDRA-13640
