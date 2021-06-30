@@ -111,6 +111,8 @@ class CqlshMixin():
                              stderr=subprocess.PIPE, stdout=subprocess.PIPE,
                              universal_newlines=True)
         for cmd in cmds.split(';'):
+            if cmd.strip() == '\n' or cmd.strip() == '':
+                continue
             p.stdin.write(cmd + terminator)
         p.stdin.write("quit;\n")
         stdout, stderr = p.communicate()
@@ -122,7 +124,7 @@ class CqlshMixin():
         if 'Unable to connect' in stderr and self.use_stargate:
             # Allows for retry
             raise NoHostAvailable('Unable to connect to any servers', {})
-        return stdout, stderr, p.returncode,
+        return stdout, stderr, p.returncode
 
 
 class TestCqlsh(Tester, CqlshMixin):
@@ -1923,16 +1925,16 @@ Tracing session:""")
         self.cluster.start()
 
         node1, = self.cluster.nodelist()
-        stdout, stderr = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--tty'])
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--tty'])
         if node1.get_cassandra_version() < '4.0':
             assert "Native protocol v4" in stdout
         else:
             assert "Native protocol v5" in stdout
 
-        stdout, stderr = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--protocol-version=4', '--tty'])
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--protocol-version=4', '--tty'])
         assert "Native protocol v4" in stdout
 
-        stdout, stderr = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--protocol-version=3', '--tty'])
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--protocol-version=3', '--tty'])
         assert "Native protocol v3" in stdout
 
     @since('3.0.19')
