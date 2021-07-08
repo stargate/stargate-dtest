@@ -580,6 +580,7 @@ class TestSchemaMetadata(Tester):
         assert 0 == len(self._keyspace_meta().user_types)
 
     @since('2.2')
+    @pytest.mark.enable_udf
     def test_creating_and_dropping_udf(self):
         assert 0 == len(self._keyspace_meta().functions), "expected to start with no indexes"
         self.session.execute("""
@@ -602,6 +603,7 @@ class TestSchemaMetadata(Tester):
         assert 0 == len(self._keyspace_meta().functions), "expected udf list to be back to zero"
 
     @since('2.2')
+    @pytest.mark.enable_udf
     def test_creating_and_dropping_uda(self):
         assert 0 == len(self._keyspace_meta().functions), "expected to start with no indexes"
         assert 0 == len(self._keyspace_meta().aggregates), "expected to start with no aggregates"
@@ -690,12 +692,14 @@ class TestSchemaMetadata(Tester):
         verify_udt_table(self.cluster.version(), self.cluster.version(), 'ks', self.session)
 
     @since('2.2')
+    @pytest.mark.enable_udf
     def test_udf(self):
         establish_udf(self.cluster.version(), self.session)
         self.session.cluster.refresh_schema_metadata()
         verify_udf(self.cluster.version(), self.cluster.version(), 'ks', self.session)
 
     @since('2.2')
+    @pytest.mark.enable_udf
     def test_uda(self):
         establish_uda(self.cluster.version(), self.session)
         self.session.cluster.refresh_schema_metadata()

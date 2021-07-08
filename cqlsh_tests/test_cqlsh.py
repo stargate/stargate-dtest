@@ -928,6 +928,7 @@ VALUES (4, blobAsInt(0x), '', blobAsBigint(0x), 0x, blobAsBoolean(0x), blobAsDec
         assert "'min_threshold': '10'" in stdout
         assert "'max_threshold': '100'" in stdout
 
+    @pytest.mark.enable_udf
     def test_describe_functions(self, fixture_dtest_setup_overrides):
         """Test DESCRIBE statements for functions and aggregate functions"""
         self.cluster.populate(1)
@@ -1848,6 +1849,7 @@ CREATE TABLE datetime_checks.values (
 Tracing session:""")
 
     @since('2.2')
+    @pytest.mark.set_batch_partitions
     def test_client_warnings(self):
         """
         Tests for CASSANDRA-9399, check client warnings:
@@ -1938,6 +1940,7 @@ Tracing session:""")
         assert "Native protocol v3" in stdout
 
     @since('3.0.19')
+    @pytest.mark.set_protocol_version_restriction
     def test_protocol_version_restriction(self):
         """
         @jira_ticket CASSANDRA-15193

@@ -552,6 +552,12 @@ def reset_stargate(request, dtest_config):
     """
     If enabled, stargate must be started before first test and restarted between tests. Restart clears its cached schema & peer info.
     """
+    def _prep_temp_dir():
+        if not os.path.exists("/tmp/dtest"):
+            os.mkdir("/tmp/dtest")
+        if os.path.exists("/tmp/dtest/cassandra.yaml"):
+            os.remove("/tmp/dtest/cassandra.yaml")
+
     if dtest_config.use_stargate:
         terminate_stargate()
         cassandra_major_version = '.'.join(dtest_config.cassandra_version_from_build.vstring.split('.')[:2])
@@ -566,7 +572,34 @@ def reset_stargate(request, dtest_config):
         if enable_auth:
             args.append('--enable-auth')
 
-        _starctl_proc = subprocess.Popen(args)
+        java_opts = ['-XX:+CrashOnOutOfMemoryError']
+        enable_udf = request.node.get_marker('enable_udf')
+        if enable_udf:
+            pytest.skip("Skipping due to known issue, see https://github.com/stargate/stargate/issues/1092")
+            _prep_temp_dir()
+            with open("/tmp/dtest/cassandra.yaml", "w") as f:
+                f.write('enable_user_defined_functions: true\n')
+                f.write('enable_scripted_user_defined_functions: true')
+
+            java_opts.append('-Dstargate.unsafe.cassandra_config_path=/tmp/dtest/cassandra.yaml')
+
+        set_batch_partitions = request.node.get_marker('set_batch_partitions')
+        if set_batch_partitions:
+            _prep_temp_dir()
+            with open("/tmp/dtest/cassandra.yaml", "w") as f:
+                f.write('unlogged_batch_across_partitions_warn_threshold: 5')
+
+            java_opts.append('-Dstargate.unsafe.cassandra_config_path=/tmp/dtest/cassandra.yaml')
+
+        set_protocol_version_restriction = request.node.get_marker('set_protocol_version_restriction')
+        if set_protocol_version_restriction:
+            _prep_temp_dir()
+            with open("/tmp/dtest/cassandra.yaml", "w") as f:
+                f.write('native_transport_max_negotiable_protocol_version: 3')
+
+            java_opts.append('-Dstargate.unsafe.cassandra_config_path=/tmp/dtest/cassandra.yaml')
+
+        _starctl_proc = subprocess.Popen(args, env={'JAVA_OPTS': ' '.join(java_opts)})
 
         if _starctl_proc.returncode:
             raise Exception('c2ctl background process failed to start correctly')

@@ -569,6 +569,9 @@ class TestMiscellaneousCQL(CQLTester):
         - ALTER the name of the table via CQL
         - SELECT from the table and assert the values inserted are there
         """
+        if self.dtest_config.use_stargate:
+            pytest.skip('Thrift is unsupported on Stargate')
+
         session = self.prepare(start_rpc=True)
 
         node = self.cluster.nodelist()[0]
