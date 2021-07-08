@@ -593,6 +593,7 @@ def reset_stargate(request, dtest_config):
 
         set_protocol_version_restriction = request.node.get_marker('set_protocol_version_restriction')
         if set_protocol_version_restriction:
+            pytest.skip("setting the protocol version restriction is currently unsupported in stargate")
             _prep_temp_dir()
             with open("/tmp/dtest/cassandra.yaml", "w") as f:
                 f.write('native_transport_max_negotiable_protocol_version: 3')
