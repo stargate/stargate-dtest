@@ -552,11 +552,17 @@ def reset_stargate(request, dtest_config):
     """
     If enabled, stargate must be started before first test and restarted between tests. Restart clears its cached schema & peer info.
     """
-    def _prep_temp_dir():
+    def _modify_cassandra_yaml(yaml_options):
+        """
+        Modify cassandra.yaml then pass those values to stargate when the config option is not exposed as a system property
+        """
         if not os.path.exists("/tmp/dtest"):
             os.mkdir("/tmp/dtest")
         if os.path.exists("/tmp/dtest/cassandra.yaml"):
             os.remove("/tmp/dtest/cassandra.yaml")
+        with open("/tmp/dtest/cassandra.yaml", "w") as f:
+            f.write('\n'.join(yaml_options))
+        java_opts.append('-Dstargate.unsafe.cassandra_config_path=/tmp/dtest/cassandra.yaml')
 
     if dtest_config.use_stargate:
         terminate_stargate()
@@ -568,37 +574,30 @@ def reset_stargate(request, dtest_config):
                '--listen', dtest_config.stargate_ip, '--cql-port', str(dtest_config.stargate_port),
                '--cluster-version', cassandra_major_version, '--simple-snitch', ]
 
-        enable_auth = request.node.get_marker('requires_sg_auth')
-        if enable_auth:
+        if request.node.get_marker('requires_sg_auth'):
             args.append('--enable-auth')
 
         java_opts = ['-XX:+CrashOnOutOfMemoryError']
-        enable_udf = request.node.get_marker('enable_udf')
-        if enable_udf:
+        if request.node.get_marker('enable_udf'):
             pytest.skip("Skipping due to known issue, see https://github.com/stargate/stargate/issues/1092")
-            _prep_temp_dir()
-            with open("/tmp/dtest/cassandra.yaml", "w") as f:
-                f.write('enable_user_defined_functions: true\n')
-                f.write('enable_scripted_user_defined_functions: true')
+            _modify_cassandra_yaml(['enable_user_defined_functions: true', 'enable_scripted_user_defined_functions: true'])
 
-            java_opts.append('-Dstargate.unsafe.cassandra_config_path=/tmp/dtest/cassandra.yaml')
+        if request.node.get_marker('set_batch_partitions'):
+            _modify_cassandra_yaml(['unlogged_batch_across_partitions_warn_threshold: 5'])
 
-        set_batch_partitions = request.node.get_marker('set_batch_partitions')
-        if set_batch_partitions:
-            _prep_temp_dir()
-            with open("/tmp/dtest/cassandra.yaml", "w") as f:
-                f.write('unlogged_batch_across_partitions_warn_threshold: 5')
+        if request.node.get_marker('set_protocol_version_restriction'):
+            pytest.skip("setting the protocol version restriction is currently unsupported in stargate, "
+                        "see https://github.com/stargate/stargate-dtest/issues/1")
+            _modify_cassandra_yaml(['native_transport_max_negotiable_protocol_version: 3'])
 
-            java_opts.append('-Dstargate.unsafe.cassandra_config_path=/tmp/dtest/cassandra.yaml')
+        if request.node.get_marker('enable_drop_compact_storage'):
+            pytest.skip("Modifying enable_drop_compact_storage is currently unsupported in stargate, "
+                        "see https://github.com/stargate/stargate-dtest/issues/1")
+            _modify_cassandra_yaml(['enable_drop_compact_storage: true'])
 
-        set_protocol_version_restriction = request.node.get_marker('set_protocol_version_restriction')
-        if set_protocol_version_restriction:
-            pytest.skip("setting the protocol version restriction is currently unsupported in stargate")
-            _prep_temp_dir()
-            with open("/tmp/dtest/cassandra.yaml", "w") as f:
-                f.write('native_transport_max_negotiable_protocol_version: 3')
-
-            java_opts.append('-Dstargate.unsafe.cassandra_config_path=/tmp/dtest/cassandra.yaml')
+        if request.node.get_marker('set_request_timeout'):
+            _modify_cassandra_yaml(['request_timeout_in_ms: 1000', 'read_request_timeout_in_ms: 1000',
+                                    'range_request_timeout_in_ms: 1000'])
 
         _starctl_proc = subprocess.Popen(args, env={'JAVA_OPTS': ' '.join(java_opts)})
 

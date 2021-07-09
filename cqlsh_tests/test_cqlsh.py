@@ -225,9 +225,8 @@ class TestCqlsh(Tester, CqlshMixin):
 
         node1, = self.cluster.nodelist()
 
-        out, err = self.run_cqlsh(node1, cmds="DESCRIBE KEYSPACES", cqlsh_options=['--ssl'], env_vars={'SSL_CERTFILE': os.path.join(self.fixture_dtest_setup.test_path, 'ccm_node.cer')})
+        out, err, _ = self.run_cqlsh(node1, cmds="DESCRIBE KEYSPACES", cqlsh_options=['--ssl'], env_vars={'SSL_CERTFILE': os.path.join(self.fixture_dtest_setup.test_path, 'ccm_node.cer')})
         assert err == ''
-
 
     def test_lwt(self):
         """

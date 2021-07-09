@@ -728,6 +728,7 @@ class TestMiscellaneousCQL(CQLTester):
                    " FROM very_wide_table", [[i for i in range(width)]])
 
     @since("3.11", max_version="3.X")
+    @pytest.mark.enable_drop_compact_storage
     def test_drop_compact_storage_flag(self):
         """
         Test for CASSANDRA-10857, verifying the schema change
@@ -819,6 +820,7 @@ class AbortedQueryTester(CQLTester):
     """
 
     def test_local_query(self):
+    @pytest.mark.set_request_timeout
         """
         Check that a query running on the local coordinator node times out:
 
@@ -864,6 +866,7 @@ class AbortedQueryTester(CQLTester):
         assert_unavailable(lambda c: logger.debug(c.execute(statement)), session)
         node.watch_log_for("operations timed out", filename='debug.log', from_mark=mark, timeout=120)
 
+    @pytest.mark.set_request_timeout
     def test_remote_query(self):
         """
         Check that a query running on a node other than the coordinator times out:
