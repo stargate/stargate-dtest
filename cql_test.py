@@ -820,7 +820,6 @@ class AbortedQueryTester(CQLTester):
     """
 
     def test_local_query(self):
-    @pytest.mark.set_request_timeout
         """
         Check that a query running on the local coordinator node times out:
 
@@ -866,7 +865,6 @@ class AbortedQueryTester(CQLTester):
         assert_unavailable(lambda c: logger.debug(c.execute(statement)), session)
         node.watch_log_for("operations timed out", filename='debug.log', from_mark=mark, timeout=120)
 
-    @pytest.mark.set_request_timeout
     def test_remote_query(self):
         """
         Check that a query running on a node other than the coordinator times out:
@@ -1047,6 +1045,7 @@ class TestCQLSlowQuery(CQLTester):
 
     @jira_ticket CASSANDRA-12403
     """
+    @pytest.mark.set_request_timeout
     def test_local_query(self):
         """
         Check that a query running locally on the coordinator is reported as slow:
@@ -1079,6 +1078,7 @@ class TestCQLSlowQuery(CQLTester):
 
         self._assert_logs_slow_queries(node, session)
 
+    @pytest.mark.set_request_timeout
     def test_remote_query(self):
         """
         Check that a query running on a node other than the coordinator is reported as slow:

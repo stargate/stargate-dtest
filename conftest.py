@@ -596,6 +596,7 @@ def reset_stargate(request, dtest_config):
             _modify_cassandra_yaml(['enable_drop_compact_storage: true'])
 
         if request.node.get_marker('set_request_timeout'):
+            pytest.skip('TODO: This test needs to be updatedto monitor stargates log for timeouts instead of cassandras')
             _modify_cassandra_yaml(['request_timeout_in_ms: 1000', 'read_request_timeout_in_ms: 1000',
                                     'range_request_timeout_in_ms: 1000'])
 
