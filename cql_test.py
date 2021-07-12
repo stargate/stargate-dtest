@@ -736,6 +736,9 @@ class TestMiscellaneousCQL(CQLTester):
 
         """
 
+        if self.dtest_config.use_stargate:
+            pytest.skip("Modifying enable_drop_compact_storage is currently unsupported in stargate, "
+                        "see https://github.com/stargate/stargate-dtest/issues/1")
         cluster = self.cluster
         cluster.set_configuration_options({'enable_drop_compact_storage': 'true'})
         cluster.populate(3).start()

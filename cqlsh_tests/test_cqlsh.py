@@ -209,6 +209,8 @@ class TestCqlsh(Tester, CqlshMixin):
 
     def test_tls(self):
         """ Test that TLSv1.2 connections work CASSANDRA-16695 """
+        if self.dtest_config.use_stargate:
+            pytest.skip("Stargate needs to be started with these client encryption options")
         generate_ssl_stores(self.fixture_dtest_setup.test_path)
         self.cluster.set_configuration_options({
             'client_encryption_options': {
