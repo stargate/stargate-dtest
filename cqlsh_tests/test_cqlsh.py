@@ -1012,6 +1012,10 @@ CREATE OR REPLACE AGGREGATE test.average(int)
         expected_keyspaces = ['system_schema', 'system', 'system_traces', 'system_views',
                               'system_auth', 'system_distributed', 'system_virtual_schema']
 
+        if self.dtest_config.use_stargate:
+            expected_keyspaces.append('data_endpoint_auth')
+            expected_keyspaces.append('stargate_system')
+
         node1, = self.cluster.nodelist()
         output, err, _ = self.run_cqlsh(node1, "DESCRIBE KEYSPACES")
 
@@ -1078,6 +1082,7 @@ CREATE TYPE test.address_type (
         assert "CREATE TABLE ks.map (" in out
 
     @since('3.0')
+    @pytest.mark.enable_mv
     def test_describe_mv(self):
         """
         @jira_ticket CASSANDRA-9961
@@ -1929,7 +1934,7 @@ Tracing session:""")
 
         node1, = self.cluster.nodelist()
         stdout, stderr, _ = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--tty'])
-        if node1.get_cassandra_version() < '4.0':
+        if node1.get_cassandra_version() < '4.0' or self.dtest_config.use_stargate:
             assert "Native protocol v4" in stdout
         else:
             assert "Native protocol v5" in stdout
@@ -2028,6 +2033,7 @@ Tracing session:""")
         assert reloaded_describe_out == describe_out
 
     @since('3.0')
+    @pytest.mark.enable_mv
     def test_materialized_view(self):
         """
         Test operations on a materialized view: create, describe, select from, drop, create using describe output.

@@ -600,6 +600,9 @@ def reset_stargate(request, dtest_config):
             _modify_cassandra_yaml(['request_timeout_in_ms: 1000', 'read_request_timeout_in_ms: 1000',
                                     'range_request_timeout_in_ms: 1000'])
 
+        if request.node.get_marker('enable_mv'):
+            _modify_cassandra_yaml(['enable_materialized_views: true'])
+
         _starctl_proc = subprocess.Popen(args, env={'JAVA_OPTS': ' '.join(java_opts)})
 
         if _starctl_proc.returncode:
