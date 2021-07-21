@@ -271,12 +271,14 @@ class Tester(object):
             pytest.fail("Log message was not seen within timeout:\n{0}".format(msg))
 
 
-def get_eager_protocol_version(cassandra_version):
+def get_eager_protocol_version(cassandra_version, use_stargate=False):
     """
     Returns the highest protocol version accepted
     by the given C* version
     """
-    if LooseVersion('4.0') <= cassandra_version:
+    # Stargate currently does not support protocol v5, this should be removed when it does.
+    # See: https://github.com/stargate/stargate/issues/770
+    if LooseVersion('4.0') <= cassandra_version and not use_stargate:
         protocol_version = 5
     elif LooseVersion('3.0') <= cassandra_version:
         protocol_version = 4
@@ -341,7 +343,7 @@ def create_cf(session, name, key_type="varchar", speculative_retry=None, read_re
         logger.warn('AlreadyExists executing create cf query \'%s\'' % query)
     session.cluster.control_connection.wait_for_schema_agreement(wait_time=120)
     #Going to ignore OperationTimedOut from create CF, so need to validate it was indeed created
-    session.execute('SELECT * FROM %s LIMIT 1' % name);
+    session.execute('SELECT * FROM %s LIMIT 1' % name)
 
 
 def create_cf_simple(session, name, query):

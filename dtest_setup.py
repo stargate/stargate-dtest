@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 def retry_till_success(fun, *args, **kwargs):
     timeout = kwargs.pop('timeout', 60)
+    sleep = kwargs.pop('sleep', 0.25)
     bypassed_exception = kwargs.pop('bypassed_exception', Exception)
 
     deadline = time.time() + timeout
@@ -42,7 +43,7 @@ def retry_till_success(fun, *args, **kwargs):
                 raise
             else:
                 # brief pause before next attempt
-                time.sleep(0.25)
+                time.sleep(sleep)
 
 
 class DTestSetup(object):
@@ -180,7 +181,10 @@ class DTestSetup(object):
                                  password=None, compression=True, protocol_version=None, port=None, ssl_opts=None,
                                  **kwargs):
 
-        node_ip = get_ip_from_node(node)
+        if self.dtest_config.use_stargate:
+            node_ip = self.dtest_config.stargate_ip
+        else:
+            node_ip = get_ip_from_node(node)
         wlrr = WhiteListRoundRobinPolicy([node_ip])
 
         return self._create_session(node, keyspace, user, password, compression,
@@ -189,12 +193,20 @@ class DTestSetup(object):
 
     def _create_session(self, node, keyspace, user, password, compression, protocol_version,
                         port=None, ssl_opts=None, execution_profiles=None, **kwargs):
-        node_ip = get_ip_from_node(node)
+        if self.dtest_config.use_stargate:
+            node_ip = self.dtest_config.stargate_ip
+        else:
+            node_ip = get_ip_from_node(node)
+
         if not port:
-            port = get_port_from_node(node)
+            if self.dtest_config.use_stargate:
+                port = self.dtest_config.stargate_port
+            else:
+                port = get_port_from_node(node)
 
         if protocol_version is None:
-            protocol_version = get_eager_protocol_version(node.cluster.version())
+            protocol_version = get_eager_protocol_version(node.cluster.version(),
+                                                          use_stargate=self.dtest_config.use_stargate)
 
         if user is not None:
             auth_provider = get_auth_provider(user=user, password=password)
@@ -222,7 +234,7 @@ class DTestSetup(object):
         return session
 
     def patient_cql_connection(self, node, keyspace=None,
-                               user=None, password=None, timeout=30, compression=True,
+                               user=None, password=None, timeout=120, compression=True,
                                protocol_version=None, port=None, ssl_opts=None, **kwargs):
         """
         Returns a connection after it stops throwing NoHostAvailables due to not being ready.
@@ -330,7 +342,7 @@ class DTestSetup(object):
             logger.debug(stderr)
 
     def supports_v5_protocol(self, cluster_version):
-        return cluster_version >= LooseVersion('4.0')
+        return cluster_version >= LooseVersion('4.0') and not self.dtest_config.use_stargate
 
     def cleanup_last_test_dir(self):
         if os.path.exists(self.last_test_dir):

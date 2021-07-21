@@ -20,12 +20,15 @@ from tempfile import NamedTemporaryFile
 from uuid import UUID, uuid4
 
 from cassandra import InvalidRequest
+from cassandra.cluster import NoHostAvailable
 from cassandra.concurrent import execute_concurrent_with_args
 from cassandra.query import BatchStatement, BatchType
 from ccmlib import common
 
+import conftest
 from .cqlsh_tools import monkeypatch_driver, unmonkeypatch_driver
 from dtest import Tester, create_ks, create_cf
+from dtest_setup import retry_till_success
 from dtest_setup_overrides import DTestSetupOverrides
 from tools.assertions import assert_all, assert_none
 from tools.data import create_c1c2_table, insert_c1c2, rows_to_list
@@ -41,9 +44,19 @@ class CqlshMixin():
 
     # If enabled, log all stdout/stderr of cqlsh commands
     cqlsh_debug_enabled = False
+    use_stargate = False
+    stargate_ip = ""
+    stargate_port = ""
+
+    @pytest.fixture(scope='function', autouse=True)
+    def fixture_set_cluster_settings(self, fixture_dtest_setup):
+        # This runs per function which is overkill, but can't seem to get the fixture_dtest_setup with scope='class'
+        self.use_stargate = fixture_dtest_setup.dtest_config.use_stargate
+        self.stargate_ip = fixture_dtest_setup.dtest_config.stargate_ip
+        self.stargate_port = fixture_dtest_setup.dtest_config.stargate_port
 
     def verify_output(self, query, node, expected):
-        output, err = self.run_cqlsh(node, query, ['-u', 'cassandra', '-p', 'cassandra'])
+        output, err, _ = self.run_cqlsh(node, query, ['-u', 'cassandra', '-p', 'cassandra'])
         if common.is_win():
             output = output.replace('\r', '')
 
@@ -63,26 +76,44 @@ class CqlshMixin():
         env['LANG'] = 'en_US.UTF-8'
         env.update(env_vars)
         if self.cluster.version() >= LooseVersion('2.1'):
-            host = node.network_interfaces['binary'][0]
-            port = node.network_interfaces['binary'][1]
+            if self.use_stargate:
+                host = self.stargate_ip
+                port = self.stargate_port
+            else:
+                host = node.network_interfaces['binary'][0]
+                port = node.network_interfaces['binary'][1]
         else:
             host = node.network_interfaces['thrift'][0]
             port = node.network_interfaces['thrift'][1]
 
         return cli, cqlsh_options + [host, str(port)], env
 
-    def run_cqlsh(self, node, cmds, cqlsh_options=None, env_vars=None):
+    def run_cqlsh(self, node, cmds, cqlsh_options=None, env_vars=None, terminator=';\n'):
         """
         Local version of run_cqlsh to open a cqlsh subprocess with
-        additional environment variables.
+        additional environment variables and Stargate proxy.
         """
+        if self.use_stargate:
+            # Allow for Stargate startup time
+            try:
+                return retry_till_success(self._run_cqlsh, node, cmds, cqlsh_options, env_vars, terminator,
+                                          bypassed_exception=NoHostAvailable, timeout=60, sleep=5)
+            except NoHostAvailable as e:
+                return '', 'Connection error: Unable to connect to any servers. Connection refused', 1
+        else:
+            return self._run_cqlsh(node, cmds, cqlsh_options, env_vars, terminator)
+
+    def _run_cqlsh(self, node, cmds, cqlsh_options=None, env_vars=None, terminator=';\n'):
+
         cli, args, env = self._get_base_cli_args(node, cqlsh_options, env_vars)
         sys.stdout.flush()
         p = subprocess.Popen([cli] + args, env=env, stdin=subprocess.PIPE,
                              stderr=subprocess.PIPE, stdout=subprocess.PIPE,
                              universal_newlines=True)
         for cmd in cmds.split(';'):
-            p.stdin.write(cmd + ';\n')
+            if cmd.strip() == '\n' or cmd.strip() == '':
+                continue
+            p.stdin.write(cmd + terminator)
         p.stdin.write("quit;\n")
         stdout, stderr = p.communicate()
         if self.cqlsh_debug_enabled:
@@ -90,7 +121,11 @@ class CqlshMixin():
             logger.debug("Cqlsh command: " + cmd)
             logger.debug("Cqlsh command stdout:\n" + stdout)
             logger.debug("Cqlsh command stderr:\n" + stderr)
-        return stdout, stderr
+        if 'Unable to connect' in stderr and self.use_stargate:
+            # Allows for retry
+            raise NoHostAvailable('Unable to connect to any servers', {})
+        return stdout, stderr, p.returncode
+
 
 class TestCqlsh(Tester, CqlshMixin):
 
@@ -161,7 +196,7 @@ class TestCqlsh(Tester, CqlshMixin):
 
         node1, = self.cluster.nodelist()
 
-        node1.run_cqlsh(cmds="""
+        self.run_cqlsh(node1, cmds="""
             CREATE KEYSPACE simple WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
             use simple;
             create TABLE simple (id int PRIMARY KEY , value text ) ;
@@ -178,6 +213,8 @@ class TestCqlsh(Tester, CqlshMixin):
 
     def test_tls(self):
         """ Test that TLSv1.2 connections work CASSANDRA-16695 """
+        if self.dtest_config.use_stargate:
+            pytest.skip("Stargate needs to be started with these client encryption options")
         generate_ssl_stores(self.fixture_dtest_setup.test_path)
         self.cluster.set_configuration_options({
             'client_encryption_options': {
@@ -194,9 +231,8 @@ class TestCqlsh(Tester, CqlshMixin):
 
         node1, = self.cluster.nodelist()
 
-        out, err = self.run_cqlsh(node1, cmds="DESCRIBE KEYSPACES", cqlsh_options=['--ssl'], env_vars={'SSL_CERTFILE': os.path.join(self.fixture_dtest_setup.test_path, 'ccm_node.cer')})
+        out, err, _ = self.run_cqlsh(node1, cmds="DESCRIBE KEYSPACES", cqlsh_options=['--ssl'], env_vars={'SSL_CERTFILE': os.path.join(self.fixture_dtest_setup.test_path, 'ccm_node.cer')})
         assert err == ''
-
 
     def test_lwt(self):
         """
@@ -210,13 +246,13 @@ class TestCqlsh(Tester, CqlshMixin):
 
         node1, = self.cluster.nodelist()
 
-        node1.run_cqlsh(cmds="""
+        self.run_cqlsh(node1, cmds="""
             CREATE KEYSPACE lwt WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
             CREATE TABLE lwt.lwt (id int PRIMARY KEY , value text)""")
 
         def assert_applied(stmt, node=node1):
             expected_substring = '[applied]'
-            output, _ = self.run_cqlsh(node, stmt)
+            output, _, _ = self.run_cqlsh(node, stmt)
             msg = '{exp} not found in output from {stmt}: {routput}'.format(
                 exp=repr(expected_substring),
                 stmt=repr(stmt),
@@ -236,7 +272,7 @@ class TestCqlsh(Tester, CqlshMixin):
 
         node1, = self.cluster.nodelist()
 
-        node1.run_cqlsh(cmds="""
+        self.run_cqlsh(node1, cmds="""
             CREATE KEYSPACE simple WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
             use simple;
             create TABLE simpledate (id int PRIMARY KEY , value timestamp ) ;
@@ -246,7 +282,7 @@ class TestCqlsh(Tester, CqlshMixin):
         session = self.patient_cql_connection(node1)
         list(session.execute("select id, value from simple.simpledate"))
 
-        output, err = self.run_cqlsh(node1, 'use simple; SELECT * FROM simpledate')
+        output, err, _ = self.run_cqlsh(node1, 'use simple; SELECT * FROM simpledate')
 
         if self.cluster.version() >= LooseVersion('3.4'):
             assert "2143-04-19 11:21:01.000000+0000" in output
@@ -266,21 +302,21 @@ class TestCqlsh(Tester, CqlshMixin):
 
         node1, = self.cluster.nodelist()
 
-        node1.run_cqlsh(cmds="""
+        self.run_cqlsh(node1, cmds="""
             CREATE KEYSPACE simple WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
             use simple;
             create TABLE testsubsecond (id int, subid timestamp, value text, primary key (id, subid));
             insert into testsubsecond (id, subid, value) VALUES (1, '1943-06-19 11:21:01.123+0000', 'abc');
             insert into testsubsecond (id, subid, value) VALUES (2, '1943-06-19 11:21:01+0000', 'def')""")
 
-        output, err, _ = node1.run_cqlsh(cmds="use simple; SELECT * FROM testsubsecond "
+        output, err, _ = self.run_cqlsh(node1, cmds="use simple; SELECT * FROM testsubsecond "
                                          "WHERE id = 1 AND subid = '1943-06-19 11:21:01.123+0000'")
 
         logger.debug(output)
         assert "1943-06-19 11:21:01.123000+0000" in output
         assert "1943-06-19 11:21:01.000000+0000" not in output
 
-        output, err, _ = node1.run_cqlsh(cmds="use simple; SELECT * FROM testsubsecond "
+        output, err, _ = self.run_cqlsh(node1, cmds="use simple; SELECT * FROM testsubsecond "
                                          "WHERE id = 2 AND subid = '1943-06-19 11:21:01+0000'")
 
         logger.debug(output)
@@ -403,7 +439,7 @@ class TestCqlsh(Tester, CqlshMixin):
             'I can eat glass and it does not hurt me': 1400
         })
 
-        output, _ = self.run_cqlsh(node, 'use testks; SELECT * FROM varcharmaptable', ['--encoding=utf-8'])
+        output, _, _ = self.run_cqlsh(node, 'use testks; SELECT * FROM varcharmaptable', ['--encoding=utf-8'])
 
         assert output.count('Можам да јадам стакло, а не ме штета.') == 16
         assert output.count(' ⠊⠀⠉⠁⠝⠀⠑⠁⠞⠀⠛⠇⠁⠎⠎⠀⠁⠝⠙⠀⠊⠞⠀⠙⠕⠑⠎⠝⠞⠀⠓⠥⠗⠞⠀⠍⠑') == 16
@@ -528,7 +564,7 @@ UPDATE varcharmaptable SET varcharvarintmap = varcharvarintmap + {'Vitrum edere 
 
 UPDATE varcharmaptable SET varcharvarintmap['Vitrum edere possum, mihi non nocet.'] = 1010010101020400204143243 WHERE varcharkey= '᚛᚛ᚉᚑᚅᚔᚉᚉᚔᚋ ᚔᚈᚔ ᚍᚂᚐᚅᚑ ᚅᚔᚋᚌᚓᚅᚐ᚜'
         """
-        node1.run_cqlsh(cmds=cmds)
+        self.run_cqlsh(node1, cmds=cmds)
 
         self.verify_glass(node1)
 
@@ -539,7 +575,7 @@ UPDATE varcharmaptable SET varcharvarintmap['Vitrum edere possum, mihi non nocet
 
         node1, = self.cluster.nodelist()
 
-        node1.run_cqlsh(cmds="SOURCE 'cqlsh_tests/glass.cql'")
+        self.run_cqlsh(node1, cmds="SOURCE 'cqlsh_tests/glass.cql'")
 
         self.verify_glass(node1)
 
@@ -645,10 +681,10 @@ VALUES (4, blobAsInt(0x), '', blobAsBigint(0x), 0x, blobAsBoolean(0x), blobAsDec
         blobAsDouble(0x), blobAsFloat(0x), '', blobAsTimestamp(0x), blobAsUuid(0x), '',
         blobAsVarint(0x))"""
 
-        node1.run_cqlsh(cmds=cmds)
+        self.run_cqlsh(node1, cmds=cmds)
 
         select_cmd = "select intcol, bigintcol, varintcol from CASSANDRA_7196.has_all_types where num in (0, 1, 2, 3, 4)"
-        output, err = self.run_cqlsh(node1, cmds=select_cmd)
+        output, err, _ = self.run_cqlsh(node1, cmds=select_cmd)
 
         if common.is_win():
             output = output.replace('\r', '')
@@ -676,13 +712,13 @@ VALUES (4, blobAsInt(0x), '', blobAsBigint(0x), 0x, blobAsBoolean(0x), blobAsDec
 
         insert_c1c2(session, n=100)
 
-        out, err = self.run_cqlsh(node1, 'TRACING ON; SELECT * FROM ks.cf')
+        out, err, _ = self.run_cqlsh(node1, 'TRACING ON; SELECT * FROM ks.cf')
         assert 'Tracing session: ' in out
 
-        out, err = self.run_cqlsh(node1, 'TRACING ON; SELECT * FROM system_traces.events')
+        out, err, _ = self.run_cqlsh(node1, 'TRACING ON; SELECT * FROM system_traces.events')
         assert 'Tracing session: ' not in out
 
-        out, err = self.run_cqlsh(node1, 'TRACING ON; SELECT * FROM system_traces.sessions')
+        out, err, _ = self.run_cqlsh(node1, 'TRACING ON; SELECT * FROM system_traces.sessions')
         assert 'Tracing session: ' not in out
 
     def test_select_element_inside_udt(self):
@@ -715,13 +751,14 @@ VALUES (4, blobAsInt(0x), '', blobAsBigint(0x), 0x, blobAsBoolean(0x), blobAsDec
             VALUES (62c36092-82a1-3a00-93d1-46196ee77204, {firstname: 'Marie-Claude', lastname: 'Josset'});
             """)
 
-        out, err = self.run_cqlsh(node1, "SELECT name.lastname FROM ks.users WHERE id=62c36092-82a1-3a00-93d1-46196ee77204")
+        out, err, _ = self.run_cqlsh(node1, "SELECT name.lastname FROM ks.users WHERE id=62c36092-82a1-3a00-93d1-46196ee77204")
         assert 'list index out of range' not in err
         # If this assertion fails check CASSANDRA-7891
 
     # If enabled, log all stdout/stderr of cqlsh commands
     cqlsh_debug_enabled = False
 
+    @pytest.mark.requires_sg_auth
     def test_list_queries(self):
         config = {'authenticator': 'org.apache.cassandra.auth.PasswordAuthenticator',
                   'authorizer': 'org.apache.cassandra.auth.CassandraAuthorizer',
@@ -892,11 +929,12 @@ VALUES (4, blobAsInt(0x), '', blobAsBigint(0x), 0x, blobAsBoolean(0x), blobAsDec
                         "WITH compaction = {'class': 'SizeTieredCompactionStrategy',"
                         "'min_threshold': 10, 'max_threshold': 100 }")
         describe_cmd = 'DESCRIBE ks.tab'
-        stdout, _ = self.run_cqlsh(node, describe_cmd)
+        stdout, _, _ = self.run_cqlsh(node, describe_cmd)
         assert "'min_threshold': '10'" in stdout
         assert "'max_threshold': '100'" in stdout
 
     @since('3.0')
+    @pytest.mark.enable_udf
     def test_describe_functions(self, fixture_dtest_setup_overrides):
         """Test DESCRIBE statements for functions and aggregate functions"""
         self.cluster.populate(1)
@@ -979,8 +1017,12 @@ CREATE OR REPLACE AGGREGATE test.average(int)
         expected_keyspaces = ['system_schema', 'system', 'system_traces', 'system_views',
                               'system_auth', 'system_distributed', 'system_virtual_schema']
 
+        if self.dtest_config.use_stargate:
+            expected_keyspaces.append('data_endpoint_auth')
+            expected_keyspaces.append('stargate_system')
+
         node1, = self.cluster.nodelist()
-        output, err = self.run_cqlsh(node1, "DESCRIBE KEYSPACES")
+        output, err, _ = self.run_cqlsh(node1, "DESCRIBE KEYSPACES")
 
         if err:
             assert False, err
@@ -1040,11 +1082,12 @@ CREATE TYPE test.address_type (
         create_ks(session, 'ks', 1)
         session.execute("CREATE TABLE map (key int PRIMARY KEY, val text)")
         describe_cmd = 'USE ks; DESCRIBE map'
-        out, err = self.run_cqlsh(node, describe_cmd)
+        out, err, _ = self.run_cqlsh(node, describe_cmd)
         assert "" == err
         assert "CREATE TABLE ks.map (" in out
 
     @since('3.0')
+    @pytest.mark.enable_mv
     def test_describe_mv(self):
         """
         @jira_ticket CASSANDRA-9961
@@ -1364,7 +1407,7 @@ CREATE TYPE test.address_type (
         logger.debug(cql)
 
         node1, = self.cluster.nodelist()
-        output, err = self.run_cqlsh(node1, cql, env_vars=env_vars)
+        output, err, _ = self.run_cqlsh(node1, cql, env_vars=env_vars)
 
         if err:
             if expected_err:
@@ -1464,7 +1507,7 @@ CREATE TYPE test.address_type (
 
         self.tempfile = NamedTemporaryFile(delete=False)
         logger.debug('Exporting to csv file: %s' % (self.tempfile.name,))
-        node1.run_cqlsh(cmds="COPY ks.testcopyto TO '%s'" % (self.tempfile.name,))
+        self.run_cqlsh(node1, cmds="COPY ks.testcopyto TO '%s'" % (self.tempfile.name,))
 
         # session
         with open(self.tempfile.name, 'r') as csvfile:
@@ -1475,7 +1518,7 @@ CREATE TYPE test.address_type (
 
         # import the CSV file with COPY FROM
         session.execute("TRUNCATE ks.testcopyto")
-        node1.run_cqlsh(cmds="COPY ks.testcopyto FROM '%s'" % (self.tempfile.name,))
+        self.run_cqlsh(node1, cmds="COPY ks.testcopyto FROM '%s'" % (self.tempfile.name,))
         new_results = list(session.execute("SELECT * FROM testcopyto"))
         assert sorted(selected_results) == sorted(new_results)
 
@@ -1486,7 +1529,7 @@ CREATE TYPE test.address_type (
 
         node1, = self.cluster.nodelist()
 
-        stdout, stderr = self.run_cqlsh(node1, cmds="""
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds="""
             CREATE KEYSPACE formatting WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
             use formatting;
             create TABLE values ( part text, id int, val1 double, val2 float, PRIMARY KEY (part, id) );
@@ -1562,7 +1605,7 @@ CREATE TYPE test.address_type (
     + | 33 |  1.1111e+07 |  1.1111e+07
 """)
 
-        stdout, stderr = self.run_cqlsh(node1, cmds="""
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds="""
             use formatting;
             insert into values (part, id, val1, val2) VALUES ('-', 1, -0.00000006, -0.00000006);
             insert into values (part, id, val1, val2) VALUES ('-', 2, -0.0000006, -0.0000006);
@@ -1636,7 +1679,7 @@ CREATE TYPE test.address_type (
     - | 33 |  -1.1111e+07 |  -1.1111e+07
 """)
 
-        stdout, stderr = self.run_cqlsh(node1, cmds="""
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds="""
             use formatting;
             insert into values (part, id, val1, val2) VALUES ('0', 1, 0, 0);
             insert into values (part, id, val1, val2) VALUES ('0', 2, 0.000000000001, 0.000000000001);
@@ -1664,7 +1707,7 @@ CREATE TYPE test.address_type (
 
         node1, = self.cluster.nodelist()
 
-        stdout, stderr = self.run_cqlsh(node1, cmds="""
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds="""
             CREATE KEYSPACE int_checks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
             USE int_checks;
             CREATE TABLE values (part text, val1 int, val2 bigint, val3 smallint, val4 tinyint, PRIMARY KEY (part));
@@ -1701,7 +1744,7 @@ CREATE TABLE int_checks.values (
 
         node1, = self.cluster.nodelist()
 
-        stdout, stderr = self.run_cqlsh(node1, cmds="""
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds="""
             CREATE KEYSPACE datetime_checks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
             USE datetime_checks;
             CREATE TABLE values (d date, t time, PRIMARY KEY (d, t));
@@ -1747,7 +1790,7 @@ CREATE TABLE datetime_checks.values (
 
         node1, = self.cluster.nodelist()
 
-        stdout, stderr = self.run_cqlsh(node1, cmds="""
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds="""
             CREATE KEYSPACE datetime_checks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
             USE datetime_checks;
             CREATE TABLE values (d date, t time, PRIMARY KEY (d, t));
@@ -1794,7 +1837,7 @@ CREATE TABLE datetime_checks.values (
 
         node1, = self.cluster.nodelist()
 
-        stdout, stderr = self.run_cqlsh(node1, cmds="""
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds="""
             CREATE KEYSPACE tracing_checks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
             USE tracing_checks;
             CREATE TABLE test (id int, val text, PRIMARY KEY (id));
@@ -1817,6 +1860,7 @@ CREATE TABLE datetime_checks.values (
 Tracing session:""")
 
     @since('2.2')
+    @pytest.mark.set_batch_partitions
     def test_client_warnings(self):
         """
         Tests for CASSANDRA-9399, check client warnings:
@@ -1841,7 +1885,7 @@ Tracing session:""")
 
         node1 = self.cluster.nodelist()[0]
 
-        stdout, stderr = self.run_cqlsh(node1, cmds="""
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds="""
             CREATE KEYSPACE client_warnings WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
             USE client_warnings;
             CREATE TABLE test (id int, val text, PRIMARY KEY (id))""")
@@ -1882,7 +1926,7 @@ Tracing session:""")
 
         node1, = self.cluster.nodelist()
 
-        stdout, stderr = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--debug', '--connect-timeout=10'])
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--debug', '--connect-timeout=10'])
         assert "Using connect timeout: 10 seconds" in stderr
 
     @since('3.0.19')
@@ -1894,19 +1938,20 @@ Tracing session:""")
         self.cluster.start()
 
         node1, = self.cluster.nodelist()
-        stdout, stderr = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--tty'])
-        if node1.get_cassandra_version() < '4.0':
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--tty'])
+        if node1.get_cassandra_version() < '4.0' or self.dtest_config.use_stargate:
             assert "Native protocol v4" in stdout
         else:
             assert "Native protocol v5" in stdout
 
-        stdout, stderr = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--protocol-version=4', '--tty'])
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--protocol-version=4', '--tty'])
         assert "Native protocol v4" in stdout
 
-        stdout, stderr = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--protocol-version=3', '--tty'])
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--protocol-version=3', '--tty'])
         assert "Native protocol v3" in stdout
 
     @since('3.0.19')
+    @pytest.mark.set_protocol_version_restriction
     def test_protocol_version_restriction(self):
         """
         @jira_ticket CASSANDRA-15193
@@ -1920,13 +1965,13 @@ Tracing session:""")
         self.cluster.start()
 
         node1, = self.cluster.nodelist()
-        stdout, stderr = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--tty'])
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--tty'])
         # yaml property is deprecated from 4.0 and has no effect
         if node1.get_cassandra_version() < '4.0':
             assert "Native protocol v3" in stdout
 
         node1, = self.cluster.nodelist()
-        stdout, stderr = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--protocol-version=4', '--tty'])
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds='USE system', cqlsh_options=['--protocol-version=4', '--tty'])
         # yaml property is deprecated from 4.0 and has no effect
         if node1.get_cassandra_version() < '4.0':
             assert "ProtocolError returned from server while using explicitly set client protocol_version 4" in stderr
@@ -1945,12 +1990,12 @@ Tracing session:""")
         # --request-timeout option needed on 2.1 due to CASSANDRA-10686
         cqlsh_opts = [] if self.cluster.version() >= LooseVersion('2.2') else ['--request-timeout=6']
 
-        stdout, stderr = self.run_cqlsh(node1, cmds="""
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds="""
               CREATE KEYSPACE training WITH replication={'class':'SimpleStrategy','replication_factor':1};
               DESCRIBE KEYSPACES""", cqlsh_options=cqlsh_opts)
         assert "training" in stdout
 
-        stdout, stderr = self.run_cqlsh(node1, """USE training;
+        stdout, stderr, _ = self.run_cqlsh(node1, """USE training;
                                                   CREATE TABLE mytable (id int, val text, PRIMARY KEY (id));
                                                   describe tables""", cqlsh_options=cqlsh_opts)
         assert "mytable" in stdout
@@ -1977,22 +2022,23 @@ Tracing session:""")
         create_ks(session, 'test_ks', 1)
         session.execute("CREATE TABLE lcs_describe (key int PRIMARY KEY) WITH compaction = "
                         "{'class': 'LeveledCompactionStrategy'}")
-        describe_out, describe_err = self.run_cqlsh(node1, 'DESCRIBE TABLE test_ks.lcs_describe')
+        describe_out, describe_err, _ = self.run_cqlsh(node1, 'DESCRIBE TABLE test_ks.lcs_describe')
 
         session.execute('DROP TABLE test_ks.lcs_describe')
 
         create_statement = 'USE test_ks; ' + ' '.join(describe_out.splitlines())
         create_statement = self.strip_read_repair_chance(create_statement)
-        create_out, create_err = self.run_cqlsh(node1, create_statement)
+        create_out, create_err, _ = self.run_cqlsh(node1, create_statement)
 
         # these statements shouldn't fall down
-        reloaded_describe_out, reloaded_describe_err = self.run_cqlsh(node1, 'DESCRIBE TABLE test_ks.lcs_describe')
+        reloaded_describe_out, reloaded_describe_err, _ = self.run_cqlsh(node1, 'DESCRIBE TABLE test_ks.lcs_describe')
         session.execute('INSERT INTO lcs_describe (key) VALUES (1)')
 
         # the table created before and after should be the same
         assert reloaded_describe_out == describe_out
 
     @since('3.0')
+    @pytest.mark.enable_mv
     def test_materialized_view(self):
         """
         Test operations on a materialized view: create, describe, select from, drop, create using describe output.
@@ -2018,32 +2064,32 @@ Tracing session:""")
         session.execute(insert_stmt + "('user3', 'ch@ngem3c', 'f', 'FL', 1978);")
         session.execute(insert_stmt + "('user4', 'ch@ngem3d', 'm', 'TX', 1974);")
 
-        describe_out, err = self.run_cqlsh(node1, 'DESCRIBE MATERIALIZED VIEW test.users_by_state')
+        describe_out, err, _ = self.run_cqlsh(node1, 'DESCRIBE MATERIALIZED VIEW test.users_by_state')
         assert 0 == len(err), err
 
-        select_out, err = self.run_cqlsh(node1, "SELECT * FROM test.users_by_state")
+        select_out, err, _ = self.run_cqlsh(node1, "SELECT * FROM test.users_by_state")
         assert 0 == len(err), err
         logger.debug(select_out)
 
-        drop_out, err = self.run_cqlsh(node1, "DROP MATERIALIZED VIEW test.users_by_state; DESCRIBE KEYSPACE test; DESCRIBE table test.users")
+        drop_out, err, _ = self.run_cqlsh(node1, "DROP MATERIALIZED VIEW test.users_by_state; DESCRIBE KEYSPACE test; DESCRIBE table test.users")
         assert 0 == len(err), err
         assert "CREATE MATERIALIZED VIEW users_by_state" not in drop_out
 
-        describe_after_drop_out, err = self.run_cqlsh(node1, 'DESCRIBE MATERIALIZED VIEW test.users_by_state')
+        describe_after_drop_out, err, _ = self.run_cqlsh(node1, 'DESCRIBE MATERIALIZED VIEW test.users_by_state')
         assert 0 == len(describe_after_drop_out.strip()), describe_after_drop_out
         assert "Materialized view 'users_by_state' not found" in err
 
         create_statement = 'USE test; ' + ' '.join(describe_out.splitlines()).strip()[:-1]
         create_statement = self.strip_default_time_to_live(create_statement)
         create_statement = self.strip_read_repair_chance(create_statement)
-        out, err = self.run_cqlsh(node1, create_statement)
+        out, err, _ = self.run_cqlsh(node1, create_statement)
         assert 0 == len(err), err
 
-        reloaded_describe_out, err = self.run_cqlsh(node1, 'DESCRIBE MATERIALIZED VIEW test.users_by_state')
+        reloaded_describe_out, err, _ = self.run_cqlsh(node1, 'DESCRIBE MATERIALIZED VIEW test.users_by_state')
         assert 0 == len(err), err
         assert describe_out == reloaded_describe_out
 
-        reloaded_select_out, err = self.run_cqlsh(node1, "SELECT * FROM test.users_by_state")
+        reloaded_select_out, err, _ = self.run_cqlsh(node1, "SELECT * FROM test.users_by_state")
         assert 0 == len(err), err
         assert select_out == reloaded_select_out
 
@@ -2085,7 +2131,7 @@ Tracing session:""")
         self.cluster.start()
         node1, = self.cluster.nodelist()
 
-        out, err = self.run_cqlsh(node1, cmd, env_vars={'TERM': 'xterm'})
+        out, err, _ = self.run_cqlsh(node1, cmd, env_vars={'TERM': 'xterm'})
         assert "" == err
 
         # Can't check escape sequence on cmd prompt. Assume no errors is good enough metric.
@@ -2101,7 +2147,7 @@ Tracing session:""")
         self.cluster.start()
         node1, = self.cluster.nodelist()
 
-        stdout, stderr = self.run_cqlsh(node1, cmds="""
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds="""
             CREATE KEYSPACE Excelsior  WITH REPLICATION={'class':'SimpleStrategy','replication_factor':1};
             CREATE TABLE excelsior.data (id int primary key);
             BEGIN BATCH INSERT INTO excelsior.data (id) VALUES (0); APPLY BATCH""")
@@ -2123,7 +2169,7 @@ Tracing session:""")
         session.execute("CREATE KEYSPACE ks WITH REPLICATION={'class':'SimpleStrategy','replication_factor':1};")
         session.execute("CREATE TABLE ks.cf (id int primary key);")
 
-        stdout, stderr = self.run_cqlsh(node1, cmds="", cqlsh_options=['-e', 'INSERT INTO ks.cf (id) VALUES (0);'])
+        stdout, stderr, _ = self.run_cqlsh(node1, cmds="", cqlsh_options=['-e', 'INSERT INTO ks.cf (id) VALUES (0);'])
 
         assert 0 == len(stderr), stderr
         assert 0 == len(stdout), stdout
@@ -2149,7 +2195,7 @@ Tracing session:""")
         for i in range(num_rows):
             session.execute("INSERT INTO ks.test (key) VALUES (uuid())")
 
-        stdout, err = self.run_cqlsh(node1, cmds="", cqlsh_options=['-e', 'SELECT * FROM ks.test;'])
+        stdout, err, _ = self.run_cqlsh(node1, cmds="", cqlsh_options=['-e', 'SELECT * FROM ks.test;'])
         assert err == ""
         output_lines = stdout.splitlines()
         assert expected_lines == len(output_lines)
@@ -2176,7 +2222,7 @@ class TestCqlshSmoke(Tester, CqlshMixin):
         create_ks(self.session, 'ks', 1)
         create_cf(self.session, 'test', key_type='uuid', columns={'i': 'int'})
 
-        out, err, _ = self.node1.run_cqlsh("INSERT INTO ks.test (key) VALUES (uuid())")
+        out, err, _ = self.run_cqlsh(self.node1, "INSERT INTO ks.test (key) VALUES (uuid())")
         assert err == ""
 
         result = list(self.session.execute("SELECT key FROM ks.test"))
@@ -2184,7 +2230,7 @@ class TestCqlshSmoke(Tester, CqlshMixin):
         assert len(result[0]) == 1
         assert isinstance(result[0][0], UUID)
 
-        out, err, _ = self.node1.run_cqlsh("INSERT INTO ks.test (key) VALUES (uuid())")
+        out, err, _ = self.run_cqlsh(self.node1, "INSERT INTO ks.test (key) VALUES (uuid())")
         assert err == ""
 
         result = list(self.session.execute("SELECT key FROM ks.test"))
@@ -2199,16 +2245,16 @@ class TestCqlshSmoke(Tester, CqlshMixin):
         create_ks(self.session, 'ks', 1)
         create_cf(self.session, 'test')
 
-        self.node1.run_cqlsh(
-            cmds="""
-            -- commented line
-            // Another comment
-            /* multiline
-             *
-             * comment */
-             """,
-            terminator="")
-        out, err, _ = self.node1.run_cqlsh("DESCRIBE KEYSPACE ks; // post-line comment")
+        self.run_cqlsh(self.node1,
+                       cmds="""
+                       -- commented line
+                       // Another comment
+                       /* multiline
+                        *
+                        * comment */
+                        """,
+                       terminator="")
+        out, err, _ = self.run_cqlsh(self.node1, "DESCRIBE KEYSPACE ks; // post-line comment")
         assert err == ""
         assert out.strip().startswith("CREATE KEYSPACE ks")
 
@@ -2216,10 +2262,10 @@ class TestCqlshSmoke(Tester, CqlshMixin):
         create_ks(self.session, 'ks', 1)
         create_cf(self.session, 'test', columns={'i': 'int'})
 
-        self.node1.run_cqlsh(
-            """
-            INSERT INTO ks.test (key) VALUES ('Cassandra:TheMovie');
-            """)
+        self.run_cqlsh(self.node1,
+                       """
+                       INSERT INTO ks.test (key) VALUES ('Cassandra:TheMovie');
+                       """)
         assert_all(self.session, "SELECT key FROM test",
                    [['Cassandra:TheMovie']])
 
@@ -2231,7 +2277,7 @@ class TestCqlshSmoke(Tester, CqlshMixin):
         assert_all(self.session, "SELECT key, c, v FROM test",
                    [['a', 'a', 'a']])
 
-        out, err, _ = self.node1.run_cqlsh("SELECT key, c, v FROM ks.test")
+        out, err, _ = self.run_cqlsh(self.node1, "SELECT key, c, v FROM ks.test")
         out_lines = [x.strip() for x in out.split("\n")]
 
         # there should be only 1 row returned & it should contain the inserted values
@@ -2243,7 +2289,7 @@ class TestCqlshSmoke(Tester, CqlshMixin):
         create_ks(self.session, 'ks', 1)
         create_cf(self.session, 'test')
 
-        self.node1.run_cqlsh("INSERT INTO ks.test (key, c, v) VALUES ('a', 'a', 'a')")
+        self.run_cqlsh(self.node1, "INSERT INTO ks.test (key, c, v) VALUES ('a', 'a', 'a')")
         assert_all(self.session, "SELECT key, c, v FROM test", [["a", "a", "a"]])
 
     def test_update(self):
@@ -2252,7 +2298,7 @@ class TestCqlshSmoke(Tester, CqlshMixin):
 
         self.session.execute("INSERT INTO test (key, c, v) VALUES ('a', 'a', 'a')")
         assert_all(self.session, "SELECT key, c, v FROM test", [["a", "a", "a"]])
-        self.node1.run_cqlsh("UPDATE ks.test SET v = 'b' WHERE key = 'a' AND c = 'a'")
+        self.run_cqlsh(self.node1, "UPDATE ks.test SET v = 'b' WHERE key = 'a' AND c = 'a'")
         assert_all(self.session, "SELECT key, c, v FROM test", [["a", "a", "b"]])
 
     def test_delete(self):
@@ -2267,7 +2313,7 @@ class TestCqlshSmoke(Tester, CqlshMixin):
         assert_all(self.session, 'SELECT key from test',
                    [['a'], ['c'], ['e'], ['d'], ['b']])
 
-        self.node1.run_cqlsh("DELETE FROM ks.test WHERE key = 'c'")
+        self.run_cqlsh(self.node1, "DELETE FROM ks.test WHERE key = 'c'")
 
         assert_all(self.session, 'SELECT key from test',
                    [['a'], ['e'], ['d'], ['b']])
@@ -2276,14 +2322,14 @@ class TestCqlshSmoke(Tester, CqlshMixin):
         create_ks(self.session, 'ks', 1)
         create_cf(self.session, 'test', columns={'i': 'int'})
         # run batch statement (inserts are fine)
-        self.node1.run_cqlsh(
-            '''
-            BEGIN BATCH
-                INSERT INTO ks.test (key) VALUES ('eggs')
-                INSERT INTO ks.test (key) VALUES ('sausage')
-                INSERT INTO ks.test (key) VALUES ('spam')
-            APPLY BATCH;
-            ''')
+        self.run_cqlsh(self.node1,
+                       '''
+                       BEGIN BATCH
+                           INSERT INTO ks.test (key) VALUES ('eggs')
+                           INSERT INTO ks.test (key) VALUES ('sausage')
+                           INSERT INTO ks.test (key) VALUES ('spam')
+                       APPLY BATCH;
+                       ''')
         # make sure everything inserted is actually there
         assert_all(self.session, 'SELECT key FROM ks.test',
                    [['eggs'], ['spam'], ['sausage']])
@@ -2291,21 +2337,21 @@ class TestCqlshSmoke(Tester, CqlshMixin):
     def test_create_keyspace(self):
         assert 'created' not in self.get_keyspace_names()
 
-        self.node1.run_cqlsh("CREATE KEYSPACE created WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 }")
+        self.run_cqlsh(self.node1, "CREATE KEYSPACE created WITH replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 }")
         assert 'created' in self.get_keyspace_names()
 
     def test_drop_keyspace(self):
         create_ks(self.session, 'ks', 1)
         assert 'ks' in self.get_keyspace_names()
 
-        self.node1.run_cqlsh('DROP KEYSPACE ks')
+        self.run_cqlsh(self.node1, 'DROP KEYSPACE ks')
 
         assert 'ks' not in self.get_keyspace_names()
 
     def test_create_table(self):
         create_ks(self.session, 'ks', 1)
 
-        self.node1.run_cqlsh('CREATE TABLE ks.test (i int PRIMARY KEY);')
+        self.run_cqlsh(self.node1, 'CREATE TABLE ks.test (i int PRIMARY KEY);')
         assert self.get_tables_in_keyspace('ks') == ['test']
 
     def test_drop_table(self):
@@ -2314,7 +2360,7 @@ class TestCqlshSmoke(Tester, CqlshMixin):
 
         assert_none(self.session, 'SELECT key FROM test')
 
-        self.node1.run_cqlsh('DROP TABLE ks.test;')
+        self.run_cqlsh(self.node1, 'DROP TABLE ks.test;')
         self.session.cluster.refresh_schema_metadata()
 
         assert 0 == len(self.session.cluster.metadata.keyspaces['ks'].tables)
@@ -2331,7 +2377,7 @@ class TestCqlshSmoke(Tester, CqlshMixin):
         assert_all(self.session, 'SELECT key from test',
                    [['a'], ['c'], ['e'], ['d'], ['b']])
 
-        self.node1.run_cqlsh('TRUNCATE ks.test;')
+        self.run_cqlsh(self.node1, 'TRUNCATE ks.test;')
         assert [] == rows_to_list(self.session.execute('SELECT * from test'))
 
     @since('2.0', max_version='2.2')
@@ -2348,7 +2394,7 @@ class TestCqlshSmoke(Tester, CqlshMixin):
                            'ascii']
         assert old_column_spec in get_ks_columns()
 
-        self.node1.run_cqlsh('ALTER TABLE ks.test ALTER i TYPE text;')
+        self.run_cqlsh(self.node1, 'ALTER TABLE ks.test ALTER i TYPE text;')
         self.session.cluster.refresh_table_metadata("ks", "test")
 
         new_columns = get_ks_columns()
@@ -2362,19 +2408,19 @@ class TestCqlshSmoke(Tester, CqlshMixin):
         create_ks(self.session, 'ks2', 1)
         create_cf(self.session, 'ks2table')
 
-        ks1_stdout, ks1_stderr, _ = self.node1.run_cqlsh(
-            '''
-            USE ks1;
-            DESCRIBE TABLES;
-            ''')
+        ks1_stdout, ks1_stderr, _ = self.run_cqlsh(self.node1,
+                                                   '''
+                                                   USE ks1;
+                                                   DESCRIBE TABLES;
+                                                   ''')
         assert [x for x in ks1_stdout.split() if x] == ['ks1table']
         assert ks1_stderr == ''
 
-        ks2_stdout, ks2_stderr, _ = self.node1.run_cqlsh(
-            '''
-            USE ks2;
-            DESCRIBE TABLES;
-            ''')
+        ks2_stdout, ks2_stderr, _ = self.run_cqlsh(self.node1,
+                                                   '''
+                                                   USE ks2;
+                                                   DESCRIBE TABLES;
+                                                   ''')
         assert [x for x in ks2_stdout.split() if x] == ['ks2table']
         assert ks2_stderr == ''
 
@@ -2397,7 +2443,7 @@ class TestCqlshSmoke(Tester, CqlshMixin):
         assert_none(self.session, requires_index)
 
         # drop the index via cqlsh, then make sure it fails
-        self.node1.run_cqlsh('DROP INDEX ks.index_to_drop;')
+        self.run_cqlsh(self.node1, 'DROP INDEX ks.index_to_drop;')
         pytest.raises(InvalidRequest, execute_requires_index)
 
     # DROP INDEX statement fails in 2.0 (see CASSANDRA-9247)
@@ -2415,7 +2461,7 @@ class TestCqlshSmoke(Tester, CqlshMixin):
         pytest.raises(InvalidRequest, execute_requires_index)
 
         # make sure index exists after creating via cqlsh
-        self.node1.run_cqlsh('CREATE INDEX index_to_drop ON ks.test (i);')
+        self.run_cqlsh(self.node1, 'CREATE INDEX index_to_drop ON ks.test (i);')
         assert_none(self.session, requires_index)
 
         # drop the index, then make sure it fails again
@@ -2444,7 +2490,7 @@ class TestCqlshSmoke(Tester, CqlshMixin):
         self.session.execute("INSERT INTO iroha (key, manyogana, modern, kana) VALUES (7, '佐伎喩女美之', '浅き夢見じ', 'あさきゆめみし')")
         self.session.execute("INSERT INTO iroha (key, manyogana, modern, kana) VALUES (8, '恵比毛勢須', '酔ひもせず', 'ゑひもせす')")
 
-        stdout, _, _ = self.node1.run_cqlsh('SELECT key, manyogana, modern, kana FROM ks.iroha')
+        stdout, _, _ = self.run_cqlsh(self.node1, 'SELECT key, manyogana, modern, kana FROM ks.iroha')
         stdout_lines_sorted = '\n'.join(sorted(stdout.split('\n')))
         expected = """
    1 | 以呂波耳本部止 | 色は匂へど | いろはにほへと
@@ -2481,22 +2527,24 @@ class TestCqlLogin(Tester, CqlshMixin):
 
         assert [message in x for x in input.split("\n") if x] == [True]
 
+    @pytest.mark.requires_sg_auth
     def test_login_keeps_keyspace(self):
         create_ks(self.session, 'ks1', 1)
         create_cf(self.session, 'ks1table')
         self.session.execute("CREATE USER user1 WITH PASSWORD 'changeme';")
 
-        cqlsh_stdout, cqlsh_stderr, _ = self.node1.run_cqlsh(
-            '''
-            USE ks1;
-            DESCRIBE TABLES;
-            LOGIN user1 'changeme';
-            DESCRIBE TABLES;
-            ''',
-            cqlsh_options=['-u', 'cassandra', '-p', 'cassandra'])
+        cqlsh_stdout, cqlsh_stderr, _ = self.run_cqlsh(self.node1,
+                                                       '''
+                                                       USE ks1;
+                                                       DESCRIBE TABLES;
+                                                       LOGIN user1 'changeme';
+                                                       DESCRIBE TABLES;
+                                                       ''',
+                                                       cqlsh_options=['-u', 'cassandra', '-p', 'cassandra'])
         assert [x for x in cqlsh_stdout.split() if x], ['ks1table' == 'ks1table']
         assert cqlsh_stderr == ''
 
+    @pytest.mark.requires_sg_auth
     def test_login_rejects_bad_pass(self):
         create_ks(self.session, 'ks1', 1)
         create_cf(self.session, 'ks1table')
@@ -2510,6 +2558,7 @@ class TestCqlLogin(Tester, CqlshMixin):
 
         self.assert_login_not_allowed('user1', cqlsh_stderr)
 
+    @pytest.mark.requires_sg_auth
     def test_login_authenticates_correct_user(self):
         create_ks(self.session, 'ks1', 1)
         create_cf(self.session, 'ks1table')
@@ -2541,6 +2590,7 @@ class TestCqlLogin(Tester, CqlshMixin):
                       "cqlsh stderr output: {}".format(expected_error,
                                                        '\n'.join(err_lines)))
 
+    @pytest.mark.requires_sg_auth
     def test_login_allows_bad_pass_and_continued_use(self):
         create_ks(self.session, 'ks1', 1)
         create_cf(self.session, 'ks1table')
@@ -2557,19 +2607,20 @@ class TestCqlLogin(Tester, CqlshMixin):
         self.assert_login_not_allowed('user1', cqlsh_stderr)
 
     @since('2.2')
+    @pytest.mark.requires_sg_auth
     def test_list_roles_after_login(self):
         """
         @jira_ticket CASSANDRA-13640
 
         Verifies that it is possible to list roles after a successful login.
         """
-        out, err, _ = self.node1.run_cqlsh(
-            '''
-            CREATE ROLE super WITH superuser = true AND password = 'p' AND login = true;
-            LOGIN super 'p';
-            LIST ROLES;
-            ''',
-            cqlsh_options=['-u', 'cassandra', '-p', 'cassandra'])
+        out, err, _ = self.run_cqlsh(self.node1,
+                                     '''
+                                     CREATE ROLE super WITH superuser = true AND password = 'p' AND login = true;
+                                     LOGIN super 'p';
+                                     LIST ROLES;
+                                     ''',
+                                     cqlsh_options=['-u', 'cassandra', '-p', 'cassandra'])
         assert 'super' in out
         assert '' == err
 
@@ -2597,7 +2648,7 @@ class TestCqlshUnicode(Tester, CqlshMixin):
         create_ks(self.session, 'ks', 1)
         create_cf(self.session, 'test', key_type='int', columns={'v': 'text'})
         self.session.execute("INSERT INTO ks.test(key, v) VALUES (1, 'FA Cup 2009–09 ϑΉӁװڜ')")
-        output, _ = self.run_cqlsh(self.node1, 'SELECT * FROM ks.test')
+        output, _, _ = self.run_cqlsh(self.node1, 'SELECT * FROM ks.test')
 
         assert "FA Cup 2009–09 ϑΉӁ" in output, "Cannot find inserted data"
 
@@ -2605,7 +2656,7 @@ class TestCqlshUnicode(Tester, CqlshMixin):
         create_ks(self.session, 'ks', 1)
         create_cf(self.session, 'test', key_type='int', columns={'v': 'text'})
         self.run_cqlsh(self.node1, "INSERT INTO ks.test(key, v) VALUES (1, 'FA Cup 2010–09 ϑΉӁװڜ')")
-        output, _ = self.run_cqlsh(self.node1, "SELECT * FROM ks.test")
+        output, _, _ = self.run_cqlsh(self.node1, "SELECT * FROM ks.test")
         assert 'FA Cup 2010–09 ϑΉӁ' in output, "Cannot find inserted data"
 
     def test_cqlsh_file_cmdline(self):
@@ -2614,50 +2665,50 @@ class TestCqlshUnicode(Tester, CqlshMixin):
         with tempfile.NamedTemporaryFile(mode='w+') as cqlfile:
             cqlfile.write("INSERT INTO ks.test(key, v) VALUES (2, 'FA Cup 2011–09 ϑΉװڜ')")
             cqlfile.seek(0)
-            _, err = self.run_cqlsh(self.node1, str(cqlfile.read()))
+            _, err, _ = self.run_cqlsh(self.node1, str(cqlfile.read()))
             assert "'ascii' codec can't decode byte" not in err, "ascii codec error detected"
-            output, _ = self.run_cqlsh(self.node1, "SELECT * FROM ks.test")
+            output, _, _ = self.run_cqlsh(self.node1, "SELECT * FROM ks.test")
             assert 'FA Cup 2011–09 ϑΉװڜ'in output, "Cannot find inserted data"
 
     def test_cqlsh_copy(self):
         create_ks(self.session, 'ks', 1)
         create_cf(self.session, 'test', key_type='int', columns={'v': 'text'})
         self.run_cqlsh(self.node1, "INSERT INTO ks.test(key, v) values (1, 'FA Cup 2013–09 ϑΉӁװڜ')")
-        output, _ = self.run_cqlsh(self.node1, "SELECT * FROM ks.test")
+        output, _, _ = self.run_cqlsh(self.node1, "SELECT * FROM ks.test")
         assert 'FA Cup 2013–09 ϑΉӁװڜ' in output, "Cannot find inserted data"
 
         with tempfile.NamedTemporaryFile() as csvfile:
             self.run_cqlsh(self.node1, cmds="COPY ks.test TO '%s';" % csvfile.name)
             self.run_cqlsh(self.node1, "truncate ks.test")
 
-            output, _ = self.run_cqlsh(self.node1, "SELECT * FROM ks.test")
+            output, _, _ = self.run_cqlsh(self.node1, "SELECT * FROM ks.test")
             assert 'FA Cup 2013–09 ϑΉӁװڜ' not in output, "Unexpected data found in table"
 
             self.run_cqlsh(self.node1, cmds="COPY ks.test FROM '%s';" % csvfile.name)
-            output, _ = self.run_cqlsh(self.node1, "SELECT * FROM ks.test")
+            output, _, _ = self.run_cqlsh(self.node1, "SELECT * FROM ks.test")
             assert 'FA Cup 2013–09 ϑΉӁװڜ' in output, "Cannot find inserted data"
 
     def test_cqlsh_source(self):
         create_ks(self.session, 'ks', 1)
         create_cf(self.session, 'test', key_type='int', columns={'v': 'text'})
-        output, _ = self.run_cqlsh(self.node1, "SELECT * FROM ks.test")
+        output, _, _ = self.run_cqlsh(self.node1, "SELECT * FROM ks.test")
         assert 'FA Cup 2011–09 ϑΉװڜ' not in output, "Unexpected data found in table"
 
         with tempfile.NamedTemporaryFile(mode='w+') as cqlfile:
             cqlfile.write("INSERT INTO ks.test(key, v) VALUES (1, 'FA Cup 2011–09 ϑΉװڜ');")
             cqlfile.seek(0)
             self.run_cqlsh(self.node1, cqlfile.read())
-            output, _ = self.run_cqlsh(self.node1, "SELECT * FROM ks.test")
+            output, _, _ = self.run_cqlsh(self.node1, "SELECT * FROM ks.test")
             assert 'FA Cup 2011–09 ϑΉװڜ' in output, "Cannot find inserted data"
 
     @since('2.2')
     def test_cqlsh_json(self):
         create_ks(self.session, 'ks', 1)
         create_cf(self.session, 'test', key_type='int', columns={'v': 'text'})
-        output, _ = self.run_cqlsh(self.node1, "select json * from ks.test")
+        output, _, _ = self.run_cqlsh(self.node1, "select json * from ks.test")
         assert 'FA Cup 2011–09 ϑΉװڜ' not in output, "Unexpected data found in table"
 
-        output, _ = self.run_cqlsh(self.node1,
+        output, _, _ = self.run_cqlsh(self.node1,
                                    cmds="""insert into ks.test JSON '{ "key" : 1, "v" : "FA Cup 2011–09 ϑΉװڜ" }'""")
-        output, _ = self.run_cqlsh(self.node1, "select * from ks.test")
+        output, _, _ = self.run_cqlsh(self.node1, "select * from ks.test")
         assert 'FA Cup 2011–09 ϑΉװڜ' in output, "Cannot find inserted data"

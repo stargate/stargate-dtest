@@ -238,6 +238,7 @@ class TestCQL(CQLTester):
         session.execute("DROP TYPE address_t")
         assert 'address_t' not in ks_meta.user_types
 
+    @pytest.mark.requires_sg_auth
     def test_user(self):
         """
         Smoke test for basic USER queries:
@@ -568,6 +569,9 @@ class TestMiscellaneousCQL(CQLTester):
         - ALTER the name of the table via CQL
         - SELECT from the table and assert the values inserted are there
         """
+        if self.dtest_config.use_stargate:
+            pytest.skip('Thrift is unsupported on Stargate')
+
         session = self.prepare(start_rpc=True)
 
         node = self.cluster.nodelist()[0]
@@ -724,6 +728,7 @@ class TestMiscellaneousCQL(CQLTester):
                    " FROM very_wide_table", [[i for i in range(width)]])
 
     @since("3.11", max_version="3.X")
+    @pytest.mark.enable_drop_compact_storage
     def test_drop_compact_storage_flag(self):
         """
         Test for CASSANDRA-10857, verifying the schema change
@@ -731,6 +736,9 @@ class TestMiscellaneousCQL(CQLTester):
 
         """
 
+        if self.dtest_config.use_stargate:
+            pytest.skip("Modifying enable_drop_compact_storage is currently unsupported in stargate, "
+                        "see https://github.com/stargate/stargate-dtest/issues/1")
         cluster = self.cluster
         cluster.set_configuration_options({'enable_drop_compact_storage': 'true'})
         cluster.populate(3).start()
@@ -1040,6 +1048,7 @@ class TestCQLSlowQuery(CQLTester):
 
     @jira_ticket CASSANDRA-12403
     """
+    @pytest.mark.set_request_timeout
     def test_local_query(self):
         """
         Check that a query running locally on the coordinator is reported as slow:
@@ -1072,6 +1081,7 @@ class TestCQLSlowQuery(CQLTester):
 
         self._assert_logs_slow_queries(node, session)
 
+    @pytest.mark.set_request_timeout
     def test_remote_query(self):
         """
         Check that a query running on a node other than the coordinator is reported as slow:

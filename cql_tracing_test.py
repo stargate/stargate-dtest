@@ -4,12 +4,13 @@ import logging
 from distutils.version import LooseVersion
 
 from dtest import Tester, create_ks
+from cqlsh_tests.test_cqlsh import CqlshMixin
 
 since = pytest.mark.since
 logger = logging.getLogger(__name__)
 
 
-class TestCqlTracing(Tester):
+class TestCqlTracing(Tester, CqlshMixin):
     """
     Smoke test that the default implementation for tracing works. Also test
     that Cassandra falls back to the default tracing implementation when the
@@ -67,19 +68,19 @@ class TestCqlTracing(Tester):
             );
         """)
 
-        out, err, _ = node1.run_cqlsh('TRACING ON')
+        out, err, _ = self.run_cqlsh(node1, 'TRACING ON')
         assert 'Tracing is enabled' in out
 
-        out, err, _ = node1.run_cqlsh('TRACING ON; SELECT * from system.peers')
+        out, err, _ = self.run_cqlsh(node1, 'TRACING ON; SELECT * from system.peers')
         assert 'Tracing session: ' in out
         assert 'Request complete ' in out
 
         # Inserts
-        out, err, _ = node1.run_cqlsh(
-            "CONSISTENCY ALL; TRACING ON; "
-            "INSERT INTO ks.users (userid, firstname, lastname, age) "
-            "VALUES (550e8400-e29b-41d4-a716-446655440000, 'Frodo', 'Baggins', 32)",
-            cqlsh_options=['--request-timeout', '30'])
+        out, err, _ = self.run_cqlsh(node1,
+                                     "CONSISTENCY ALL; TRACING ON; "
+                                     "INSERT INTO ks.users (userid, firstname, lastname, age) "
+                                     "VALUES (550e8400-e29b-41d4-a716-446655440000, 'Frodo', 'Baggins', 32)",
+                                     cqlsh_options=['--request-timeout', '30'])
         logger.debug(out)
         assert 'Tracing session: ' in out
 
@@ -91,10 +92,10 @@ class TestCqlTracing(Tester):
         assert 'Request complete ' in out
 
         # Queries
-        out, err, _ = node1.run_cqlsh('CONSISTENCY ALL; TRACING ON; '
-                                      'SELECT firstname, lastname '
-                                      'FROM ks.users WHERE userid = 550e8400-e29b-41d4-a716-446655440000',
-                                      cqlsh_options=['--request-timeout', '30'])
+        out, err, _ = self.run_cqlsh(node1, 'CONSISTENCY ALL; TRACING ON; '
+                                            'SELECT firstname, lastname '
+                                            'FROM ks.users WHERE userid = 550e8400-e29b-41d4-a716-446655440000',
+                                            cqlsh_options=['--request-timeout', '30'])
         logger.debug(out)
         assert 'Tracing session: ' in out
 

@@ -6,6 +6,7 @@ import os
 import platform
 import re
 import shutil
+import subprocess
 import time
 from datetime import datetime
 from distutils.version import LooseVersion
@@ -25,6 +26,7 @@ from dtest_setup import DTestSetup
 from dtest_setup_overrides import DTestSetupOverrides
 
 logger = logging.getLogger(__name__)
+_starctl_proc = None
 
 
 def check_required_loopback_interfaces_available():
@@ -39,7 +41,8 @@ def check_required_loopback_interfaces_available():
         if len(ni.ifaddresses('lo0')[AF_INET]) < 9:
             pytest.exit("At least 9 loopback interfaces are required to run dtests. "
                         "On Mac you can create the required loopback interfaces by running "
-                        "'for i in {1..9}; do sudo ifconfig lo0 alias 127.0.0.$i up; done;'")
+                        "'for i in {1..9}; do sudo ifconfig lo0 alias 127.0.0.$i up; done;'"
+                        "With stargate, also run 'sudo ifconfig lo0 alias 127.0.9.1'")
 
 
 def pytest_addoption(parser):
@@ -95,6 +98,8 @@ def pytest_addoption(parser):
                      help="When running upgrade tests, only run tests upgrading to the current version")
     parser.addoption("--metatests", action="store_true", default=False,
                      help="Run only meta tests")
+    parser.addoption("--stargate-cmd", action="store", default=None,
+                 help="Command path for creating Stargate node as proxy coordinator. Path to script only, no args.")
 
 
 def pytest_configure(config):
@@ -537,6 +542,80 @@ def dtest_config(request):
         pytest.exit("{}. Did you remember to build C*? ('ant clean jar')".format(e))
 
     yield dtest_config
+
+    # All tests done/skipped, so time to teardown
+    terminate_stargate()
+
+
+@pytest.fixture(scope='function', autouse=True)
+def reset_stargate(request, dtest_config):
+    """
+    If enabled, stargate must be started before first test and restarted between tests. Restart clears its cached schema & peer info.
+    """
+    def _modify_cassandra_yaml(yaml_options):
+        """
+        Modify cassandra.yaml then pass those values to stargate when the config option is not exposed as a system property
+        """
+        if not os.path.exists("/tmp/dtest"):
+            os.mkdir("/tmp/dtest")
+        if os.path.exists("/tmp/dtest/cassandra.yaml"):
+            os.remove("/tmp/dtest/cassandra.yaml")
+        with open("/tmp/dtest/cassandra.yaml", "w") as f:
+            f.write('\n'.join(yaml_options))
+        java_opts.append('-Dstargate.unsafe.cassandra_config_path=/tmp/dtest/cassandra.yaml')
+
+    if dtest_config.use_stargate:
+        terminate_stargate()
+        cassandra_major_version = '.'.join(dtest_config.cassandra_version_from_build.vstring.split('.')[:2])
+
+        # Start stargate, binding to a unique IP, connecting to backend ccm cluster at 127.0.0.1
+        global _starctl_proc
+        args = [dtest_config.stargate_cmd, '--cluster-name', fixture_dtest_cluster_name(), '--cluster-seed', '127.0.0.1',
+               '--listen', dtest_config.stargate_ip, '--cql-port', str(dtest_config.stargate_port),
+               '--cluster-version', cassandra_major_version, '--simple-snitch', ]
+
+        if request.node.get_marker('requires_sg_auth'):
+            args.append('--enable-auth')
+
+        java_opts = ['-XX:+CrashOnOutOfMemoryError']
+        if request.node.get_marker('enable_udf'):
+            pytest.skip("Skipping due to known issue, see https://github.com/stargate/stargate/issues/1092")
+            _modify_cassandra_yaml(['enable_user_defined_functions: true', 'enable_scripted_user_defined_functions: true'])
+
+        if request.node.get_marker('set_batch_partitions'):
+            _modify_cassandra_yaml(['unlogged_batch_across_partitions_warn_threshold: 5'])
+
+        if request.node.get_marker('set_protocol_version_restriction'):
+            pytest.skip("setting the protocol version restriction is currently unsupported in stargate, "
+                        "see https://github.com/stargate/stargate-dtest/issues/1")
+            _modify_cassandra_yaml(['native_transport_max_negotiable_protocol_version: 3'])
+
+        if request.node.get_marker('enable_drop_compact_storage'):
+            pytest.skip("Modifying enable_drop_compact_storage is currently unsupported in stargate, "
+                        "see https://github.com/stargate/stargate-dtest/issues/1")
+            _modify_cassandra_yaml(['enable_drop_compact_storage: true'])
+
+        if request.node.get_marker('set_request_timeout'):
+            pytest.skip('TODO: This test needs to be updatedto monitor stargates log for timeouts instead of cassandras')
+            _modify_cassandra_yaml(['request_timeout_in_ms: 1000', 'read_request_timeout_in_ms: 1000',
+                                    'range_request_timeout_in_ms: 1000'])
+
+        if request.node.get_marker('enable_mv'):
+            _modify_cassandra_yaml(['enable_materialized_views: true'])
+
+        _starctl_proc = subprocess.Popen(args, env={'JAVA_OPTS': ' '.join(java_opts)})
+
+        if _starctl_proc.returncode:
+            raise Exception('c2ctl background process failed to start correctly')
+        else:
+            logger.info("Started Stargate node listening at {}:{}".format(dtest_config.stargate_ip,
+                                                                          dtest_config.stargate_port))
+
+
+def terminate_stargate():
+    global _starctl_proc
+    if _starctl_proc:
+        _starctl_proc.kill()
 
 
 def cassandra_dir_and_version(config):

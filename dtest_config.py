@@ -28,6 +28,11 @@ class DTestConfig:
         self.keep_test_dir = False
         self.keep_failed_test_dir = False
         self.enable_jacoco_code_coverage = False
+        self.use_stargate = False
+        self.stargate_cmd = None
+
+        self.stargate_ip = '127.0.9.1'
+        self.stargate_port = 9052
         self.jemalloc_path = find_libjemalloc()
         self.metatests = False
 
@@ -71,6 +76,8 @@ class DTestConfig:
         self.keep_test_dir = config.getoption("--keep-test-dir")
         self.keep_failed_test_dir = config.getoption("--keep-failed-test-dir")
         self.enable_jacoco_code_coverage = config.getoption("--enable-jacoco-code-coverage")
+        self.stargate_cmd = config.getoption("--stargate-cmd")
+        self.use_stargate = self.stargate_cmd is not None
 
         if self.cassandra_version is None and self.cassandra_version_from_build is None:
             raise UsageError("Required dtest arguments were missing! You must provide either --cassandra-dir "
